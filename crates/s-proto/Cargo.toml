@@ -1,0 +1,25 @@
+[package]
+name = "s-proto"
+description = "s wire contract: Noise_IK framing, 5-verb canonical JSON schema, SSHSIG verifier, Mach-O CDHash, tree digest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Test-only signing helpers (software Ed25519 standing in for a FIDO2 authenticator).
+testkit = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+snow.workspace = true
+
+[[example]]
+name = "sshsig_verify"
+
+[[example]]
+name = "sk_fixture"
+required-features = ["testkit"]

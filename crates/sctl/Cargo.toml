@@ -1,0 +1,14 @@
+[package]
+name = "sctl"
+description = "Host CLI for the /s Userland-SIP plane over Noise_IK AF_VSOCK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+s-proto.workspace = true
+s-ledger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
