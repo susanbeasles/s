@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/s-proto", "crates/s-ledger", "crates/s-vsockd", "crates/sctl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+s-proto = { path = "crates/s-proto" }
+s-ledger = { path = "crates/s-ledger" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ed25519-dalek = "2"
+snow = "0.9"
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

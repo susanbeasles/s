@@ -1,0 +1,17 @@
+[package]
+name = "s-vsockd"
+description = "Sibling-VM Userland-SIP authority daemon owning master/ledger/live volumes over Noise_IK AF_VSOCK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+s-proto.workspace = true
+s-ledger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+s-proto = { workspace = true, features = ["testkit"] }

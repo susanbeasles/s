@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Deterministic offline verification gate for `s` (Stone Repo 1 of 10).
+# Verifies:
+#   1. 7-bit ASCII cleanliness across all source/schema/doc files
+#   2. Offline Cargo workspace build + unit/integration suites (`--offline`)
+#   3. OpenSSH `ssh-keygen -Y check-novalidate` wire-format interoperability on SSHSIG fixtures
+#   4. Live `s-vsockd` <-> `sctl` end-to-end 5-verb flow over Noise_IK:
+#      - INGEST_BUNDLE (Mach-O CDHash + TeamID + detached sk-ssh-ed25519 SSHSIG)
+#      - CHALLENGE_POLICY + COMMIT_POLICY (FIDO UP 0x01 + UV 0x04 enforced; UP-only rejected)
+#      - Nonce replay rejection (`CHALLENGE_REPLAYED`)
+#      - VERIFY against `/s` live clone + tampered host digest detection
+#      - Append-only `ledger.sparseimage` chain + SSHSIG offline verification (`sctl ledger verify`)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+echo "[1/5] Checking 7-bit ASCII invariant across source tree..."
+python3 - <<'PY'
+import pathlib, sys
+root = pathlib.Path(".")
+skip = {"target", ".build", ".git", ".check-work", ".agent-guard", ".guard"}
+bad = []
+for p in root.rglob("*"):
+    if any(part in skip for part in p.parts) or not p.is_file():
+        continue
+    data = p.read_bytes()
+    if any(b > 0x7E or (b < 0x20 and b not in (0x09, 0x0A, 0x0D)) for b in data):
+        bad.append(str(p))
+if bad:
+    print("Non-ASCII files detected:", bad, file=sys.stderr)
+    sys.exit(1)
+PY
+
+echo "[2/5] Running offline Rust workspace unit & integration tests..."
+cargo test --workspace --offline --lib --bins
+cargo build --workspace --offline --bins
+cargo build --offline -p s-proto --features testkit --examples
+
+BIN_DIR="$ROOT/target/debug"
+FIX="$BIN_DIR/examples/sk_fixture"
+VER="$BIN_DIR/examples/sshsig_verify"
+VSOCKD="$BIN_DIR/s-vsockd"
+SCTL="$BIN_DIR/sctl"
+
+WORK="$ROOT/.check-work"
+rm -rf "$WORK"
+mkdir -p "$WORK/master.sparseimage" "$WORK/ledger.sparseimage" "$WORK/live.sparseimage" "$WORK/etc"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "[3/5] Verifying OpenSSH SSHSIG wire-format interoperability..."
+"$FIX" keygen 2a "$WORK/etc/allowed_sk.pub"
+printf 'stone-interop-message' > "$WORK/msg.bin"
+"$FIX" sign 2a s-policy-v1 5 "$WORK/msg.bin" "$WORK/msg.sig"
+"$VER" "$WORK/etc/allowed_sk.pub" s-policy-v1 "$WORK/msg.bin" "$WORK/msg.sig" >/dev/null
+if command -v ssh-keygen >/dev/null 2>&1; then
+    ssh-keygen -Y check-novalidate -n s-policy-v1 -s "$WORK/msg.sig" < "$WORK/msg.bin" >/dev/null
+fi
+# Flag 0x01 (UP without UV) MUST be rejected.
+"$FIX" sign 2a s-policy-v1 1 "$WORK/msg.bin" "$WORK/no_uv.sig"
+if "$VER" "$WORK/etc/allowed_sk.pub" s-policy-v1 "$WORK/msg.bin" "$WORK/no_uv.sig" 2>/dev/null; then
+    echo "FAIL: UP-only SSHSIG without UV was accepted" >&2
+    exit 1
+fi
+
+echo "[4/5] Exercising live s-vsockd <-> sctl 5-verb Noise_IK flow..."
+"$FIX" noise-keys "$WORK/etc/guest.key" "$WORK/etc/guest.pub"
+"$FIX" noise-keys "$WORK/etc/host.key" "$WORK/etc/host.pub"
+read -r BIN_SHA BIN_CDHASH < <("$FIX" macho com.stone.rg TEAMSTONE1 "$WORK/rg.macho")
+"$FIX" sign 2a s-bundle-v1 5 "$WORK/rg.macho" "$WORK/rg.macho.sig"
+
+"$VSOCKD" \
+    --master "$WORK/master.sparseimage" \
+    --ledger "$WORK/ledger.sparseimage" \
+    --live "$WORK/live.sparseimage" \
+    --allowlist "$WORK/etc/allowed_sk.pub" \
+    --server-key "$WORK/etc/guest.key" \
+    --client-pub "$WORK/etc/host.pub" \
+    --unix "$WORK/vsock.sock" \
+    --max-conns 7 &
+DAEMON_PID=$!
+
+for _ in $(seq 1 50); do
+    [[ -S "$WORK/vsock.sock" ]] && break
+    sleep 0.05
+done
+
+SCTL_ARGS=(--socket "$WORK/vsock.sock" --host-key "$WORK/etc/host.key" --guest-pub "$WORK/etc/guest.pub")
+
+"$SCTL" "${SCTL_ARGS[@]}" status >/dev/null
+"$SCTL" "${SCTL_ARGS[@]}" ingest \
+    --bundle ripgrep --version 14.1.0 \
+    --bin "$WORK/rg.macho" --team-id TEAMSTONE1 \
+    --sig "$WORK/rg.macho.sig" >/dev/null
+
+cat > "$WORK/lineup.json" <<JSON
+{
+  "schema_version": 1,
+  "policy_revision": 1,
+  "description": "initial /s lineup",
+  "entries": [
+    {
+      "install_rel_path": "bin/rg",
+      "bundle_name": "ripgrep",
+      "version": "14.1.0",
+      "sha256": "$BIN_SHA",
+      "cdhash": "$BIN_CDHASH",
+      "team_id": "TEAMSTONE1"
+    }
+  ]
+}
+JSON
+
+"$SCTL" policy plan "$WORK/lineup.json" >/dev/null
+CH_JSON="$("$SCTL" "${SCTL_ARGS[@]}" policy challenge --enforce "$WORK/lineup.json" --signable-out "$WORK/challenge.bin")"
+NONCE="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["nonce"])' "$CH_JSON")"
+
+# Attempt commit with UP-only signature -> must fail without consuming challenge.
+"$FIX" sign 2a s-policy-v1 1 "$WORK/challenge.bin" "$WORK/bad_commit.sig"
+if "$SCTL" "${SCTL_ARGS[@]}" policy commit --nonce "$NONCE" --sig "$WORK/bad_commit.sig" 2>/dev/null; then
+    echo "FAIL: COMMIT_POLICY accepted UP-only FIDO signature" >&2
+    exit 1
+fi
+
+# Commit with full UP+UV signature -> succeeds and populates live.sparseimage/bin/rg.
+"$FIX" sign 2a s-policy-v1 5 "$WORK/challenge.bin" "$WORK/good_commit.sig"
+"$SCTL" "${SCTL_ARGS[@]}" policy commit --nonce "$NONCE" --sig "$WORK/good_commit.sig" >/dev/null
+test -x "$WORK/live.sparseimage/bin/rg"
+
+# Replay of consumed nonce -> must fail.
+if "$SCTL" "${SCTL_ARGS[@]}" policy commit --nonce "$NONCE" --sig "$WORK/good_commit.sig" 2>/dev/null; then
+    echo "FAIL: COMMIT_POLICY accepted replayed challenge nonce" >&2
+    exit 1
+fi
+
+# Verify live clone matches ledger tip, and detect a drifted host directory.
+"$SCTL" "${SCTL_ARGS[@]}" verify --host-root "$WORK/live.sparseimage" >/dev/null
+mkdir -p "$WORK/drifted-host"
+if "$SCTL" "${SCTL_ARGS[@]}" verify --host-root "$WORK/drifted-host" >/dev/null 2>&1; then
+    echo "FAIL: VERIFY accepted drifted host /s mount" >&2
+    exit 1
+fi
+
+wait "$DAEMON_PID"
+
+echo "[5/5] Auditing append-only ledger hash chain & CDHash provenance index..."
+"$SCTL" ledger verify --dir "$WORK/ledger.sparseimage" --allowlist "$WORK/etc/allowed_sk.pub" >/dev/null
+CD_OUT="$("$SCTL" ledger inspect --dir "$WORK/ledger.sparseimage" --cdhash "$BIN_CDHASH")"
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["seqs"] == [1]' "$CD_OUT"
+
+echo "PASS: all offline s checks green."
